@@ -3,6 +3,7 @@
 .concourse.yml
 .gitignore
 .bot.log
+.travis.yml
 LICENSE
 Makefile
 prometheus_bot
