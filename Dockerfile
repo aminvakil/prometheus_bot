@@ -5,7 +5,7 @@ RUN cd /app && \
     go get -d -v && \
     CGO_ENABLED=0 GOOS=linux go build -v -a -installsuffix cgo -o prometheus_bot
 
-FROM alpine:3.14.2
+FROM alpine:3.14.3
 COPY --from=builder /app/prometheus_bot /
 RUN apk add --no-cache ca-certificates tzdata tini
 USER nobody
