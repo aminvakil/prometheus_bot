@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - master
+concurrency: ci-${{ github.ref }}
 
 jobs:
 
