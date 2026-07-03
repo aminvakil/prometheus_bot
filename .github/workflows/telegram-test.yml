@@ -1,0 +1,167 @@
+---
+name: Telegram test
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  mock_test:
+    name: Send message through mocked Telegram
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the codebase.
+        uses: actions/checkout@main
+
+      - name: Build docker image.
+        run: docker build --no-cache --tag ${GITHUB_REPOSITORY,,}:${GITHUB_RUN_ID} .
+
+      - name: Test Telegram send.
+        run: |
+          set -euo pipefail
+
+          image="${GITHUB_REPOSITORY,,}:${GITHUB_RUN_ID}"
+          workdir="$(mktemp -d)"
+
+          cleanup() {
+            status=$?
+            docker logs prometheus-bot-test 2>/dev/null || true
+            docker logs mock-telegram 2>/dev/null || true
+            docker rm -f prometheus-bot-test mock-telegram 2>/dev/null || true
+            docker network rm telegram-test 2>/dev/null || true
+            rm -rf "$workdir"
+            exit "$status"
+          }
+          trap cleanup EXIT
+
+          openssl req -x509 -newkey rsa:2048 -days 1 -nodes \
+            -keyout "$workdir/ca.key" \
+            -out "$workdir/ca.crt" \
+            -subj "/CN=Mock Telegram CA"
+
+          cat > "$workdir/server.cnf" <<'EOF'
+          [req]
+          distinguished_name = dn
+          req_extensions = v3_req
+          prompt = no
+          [dn]
+          CN = api.telegram.org
+          [v3_req]
+          subjectAltName = @alt_names
+          [alt_names]
+          DNS.1 = api.telegram.org
+          EOF
+
+          openssl req -new -nodes -newkey rsa:2048 \
+            -keyout "$workdir/server.key" \
+            -out "$workdir/server.csr" \
+            -config "$workdir/server.cnf"
+          openssl x509 -req \
+            -in "$workdir/server.csr" \
+            -CA "$workdir/ca.crt" \
+            -CAkey "$workdir/ca.key" \
+            -CAcreateserial \
+            -out "$workdir/server.crt" \
+            -days 1 \
+            -sha256 \
+            -extensions v3_req \
+            -extfile "$workdir/server.cnf"
+          cp /etc/ssl/certs/ca-certificates.crt "$workdir/ca-certificates.crt"
+          cat "$workdir/ca.crt" >> "$workdir/ca-certificates.crt"
+
+          cat > "$workdir/mock_telegram.py" <<'PY'
+          import json
+          import ssl
+          import sys
+          from http.server import BaseHTTPRequestHandler, HTTPServer
+          from urllib.parse import parse_qsl, urlparse
+
+          requests_path = sys.argv[1]
+          cert_path = sys.argv[2]
+          key_path = sys.argv[3]
+          token = "123456:mock-token"
+
+          class Handler(BaseHTTPRequestHandler):
+              def log_message(self, format, *args):
+                  return
+
+              def do_POST(self):
+                  length = int(self.headers.get("Content-Length", "0"))
+                  body = self.rfile.read(length).decode()
+                  parts = urlparse(self.path).path.strip("/").split("/")
+                  if len(parts) != 2 or parts[0] != f"bot{token}":
+                      self.respond({"ok": False, "description": "bad token path"})
+                      return
+
+                  method = parts[1]
+                  params = dict(parse_qsl(body))
+                  with open(requests_path, "a", encoding="utf-8") as requests_file:
+                      requests_file.write(json.dumps({"method": method, "params": params}, sort_keys=True) + "\n")
+
+                  if method == "getMe":
+                      self.respond({"ok": True, "result": {"id": 123456, "is_bot": True, "first_name": "Mock", "username": "mock_bot"}})
+                  elif method == "sendMessage":
+                      self.respond({"ok": True, "result": {"message_id": 1, "date": 0, "chat": {"id": int(params["chat_id"]), "type": "private"}, "text": params.get("text", "")}})
+                  else:
+                      self.respond({"ok": False, "description": f"unexpected method {method}"})
+
+              def respond(self, payload):
+                  data = json.dumps(payload).encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "application/json")
+                  self.send_header("Content-Length", str(len(data)))
+                  self.end_headers()
+                  self.wfile.write(data)
+
+          server = HTTPServer(("0.0.0.0", 443), Handler)
+          context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+          context.load_cert_chain(cert_path, key_path)
+          server.socket = context.wrap_socket(server.socket, server_side=True)
+          server.serve_forever()
+          PY
+
+          cat > "$workdir/config.yml" <<'YAML'
+          telegram_token: "123456:mock-token"
+          send_only: true
+          YAML
+          touch "$workdir/telegram_requests.jsonl"
+
+          docker network create telegram-test
+          docker run -d --name mock-telegram \
+            --network telegram-test \
+            -v "$workdir:/work" \
+            -w /work \
+            python:3-alpine \
+            python /work/mock_telegram.py /work/telegram_requests.jsonl /work/server.crt /work/server.key
+
+          mock_ip="$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' mock-telegram)"
+          docker run -d --name prometheus-bot-test \
+            --network telegram-test \
+            --add-host api.telegram.org:"$mock_ip" \
+            -p 127.0.0.1:9087:9087 \
+            -v "$workdir/config.yml:/config.yml:ro" \
+            -v "$workdir/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro" \
+            "$image" /prometheus_bot -c /config.yml -l :9087
+
+          for i in {1..30}; do
+            if response="$(curl -fsS http://127.0.0.1:9087/ping/12345 2>/dev/null)"; then
+              echo "$response"
+              break
+            fi
+            if ! docker ps -q -f name=prometheus-bot-test -f status=running | grep -q .; then
+              echo "prometheus_bot container stopped before the test completed"
+              exit 1
+            fi
+            sleep 1
+          done
+
+          test "${response:-}" != ""
+          echo "$response" | grep -q "12345:0"
+          grep -q '"method": "getMe"' "$workdir/telegram_requests.jsonl"
+          grep -q '"method": "sendMessage"' "$workdir/telegram_requests.jsonl"
+          grep -q '"chat_id": "12345"' "$workdir/telegram_requests.jsonl"
